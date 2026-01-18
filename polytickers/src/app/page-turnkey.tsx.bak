@@ -1,0 +1,1501 @@
+'use client'
+
+import React, { useState, useEffect, useCallback } from 'react'
+import { useTurnkey } from '@turnkey/react-wallet-kit'
+import { usePolymarketTrading } from '@/lib/usePolymarketTrading'
+
+// Types
+interface MarketOutcome {
+  name: string
+  price: number
+  tokenId: string
+}
+
+interface Market {
+  id: string
+  conditionId: string
+  question: string
+  slug: string
+  description: string
+  image: string | null
+  category: string | null
+  endDate: string
+  outcomes: MarketOutcome[]
+  volume: number
+  liquidity: number
+  yesPrice: number
+  noPrice: number
+  negRisk?: boolean // Market type - critical for order submission
+  hasTokenIds?: boolean
+  isUserCreated?: boolean
+}
+
+interface Position {
+  id: number
+  marketId: string
+  question: string
+  side: 'YES' | 'NO'
+  stake: number
+  entryPrice: number
+  currentPrice: number
+  tokenId: string
+}
+
+interface Balances {
+  solana: { sol: number; usdc: number }
+  polygon: { matic: number; usdc: number }
+}
+
+// Helpers
+const fmtUsd = (n: number) => n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const fmtVol = (v: number) => v >= 1000000 ? `$${(v / 1000000).toFixed(1)}M` : v >= 1000 ? `$${(v / 1000).toFixed(1)}K` : `$${v.toFixed(0)}`
+const fmtCents = (p: number) => `${Math.round(p * 100)}c`
+
+function getTimeRemaining(endDate: string) {
+  const end = new Date(endDate).getTime()
+  const now = Date.now()
+  const total = Math.max(0, end - now)
+  const days = Math.floor(total / (1000 * 60 * 60 * 24))
+  const hours = Math.floor((total % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60))
+  const minutes = Math.floor((total % (1000 * 60 * 60)) / (1000 * 60))
+  
+  if (days > 0) return `${days}D ${hours}H`
+  if (hours > 0) return `${hours}H ${minutes}M`
+  return `${minutes}M`
+}
+
+export default function Home() {
+  // Turnkey auth
+  const { user, handleLogin, logout, wallets, createWallet, session, httpClient } = useTurnkey()
+  
+  // Wallet addresses (both chains)
+  const [solanaAddress, setSolanaAddress] = useState<string | null>(null)
+  const [polygonAddress, setPolygonAddress] = useState<string | null>(null)
+  const [balances, setBalances] = useState<Balances>({ solana: { sol: 0, usdc: 0 }, polygon: { matic: 0, usdc: 0 } })
+  const [balancesLoading, setBalancesLoading] = useState(false)
+  
+  // Polymarket trading hook
+  const {
+    tradingSession,
+    isInitializing: isTradingInitializing,
+    error: tradingError,
+    currentStep: tradingStep,
+    initializeTradingSession,
+    placeOrder,
+    endTradingSession,
+  } = usePolymarketTrading(httpClient, session, polygonAddress)
+  
+  // App state
+  const [view, setView] = useState<'markets' | 'positions' | 'wallet' | 'create'>('markets')
+  const [markets, setMarkets] = useState<Market[]>([])
+  const [userMarkets, setUserMarkets] = useState<Market[]>([])
+  const [marketsLoading, setMarketsLoading] = useState(true)
+  const [positions, setPositions] = useState<Position[]>([])
+  const [selectedMarket, setSelectedMarket] = useState<Market | null>(null)
+  
+  // Demo mode
+  const [demoBal, setDemoBal] = useState(10000)
+  const [isRealMoney, setIsRealMoney] = useState(false)
+  
+  // UI state
+  const [quickBetAmount, setQuickBetAmount] = useState(25)
+  const [showDepositModal, setShowDepositModal] = useState(false)
+  const [showSendModal, setShowSendModal] = useState(false)
+  const [bridgeQuote, setBridgeQuote] = useState<any>(null)
+  const [bridgeLoading, setBridgeLoading] = useState(false)
+  const [bridgeAmount, setBridgeAmount] = useState('')
+  const [bridgeToken, setBridgeToken] = useState<'SOL' | 'USDC'>('SOL')
+  const [bridgeDirection, setBridgeDirection] = useState<'deposit' | 'withdraw'>('deposit')
+  const [withdrawToken, setWithdrawToken] = useState<'SOL' | 'USDC'>('USDC')
+  const [bridgeTxRequest, setBridgeTxRequest] = useState<any>(null)
+  const [bridgeExecuting, setBridgeExecuting] = useState(false)
+  
+  // Create market form
+  const [newMarketQuestion, setNewMarketQuestion] = useState('')
+  const [newMarketCategory, setNewMarketCategory] = useState('')
+  const [newMarketEndDate, setNewMarketEndDate] = useState('')
+  
+  // Stats
+  const [stats, setStats] = useState({ totalPnl: 0, totalTrades: 0, wins: 0, losses: 0 })
+
+  const isConnected = !!user
+  const tradingBalance = isRealMoney ? balances.polygon.usdc : demoBal
+
+  // Extract wallet addresses when wallets change
+  useEffect(() => {
+    if (wallets && wallets.length > 0) {
+      const wallet = wallets[0]
+      if (wallet.accounts) {
+        for (const account of wallet.accounts) {
+          if (account.addressFormat === 'ADDRESS_FORMAT_SOLANA') {
+            setSolanaAddress(account.address)
+          } else if (account.addressFormat === 'ADDRESS_FORMAT_ETHEREUM') {
+            setPolygonAddress(account.address)
+          }
+        }
+      }
+    }
+  }, [wallets])
+
+  // Create wallet with both chains after login
+  const ensureWallet = useCallback(async () => {
+    if (!session || !createWallet) return
+    
+    // Check if wallet already exists
+    if (wallets && wallets.length > 0) return
+    
+    try {
+      await createWallet({
+        walletName: 'Main Wallet',
+        accounts: ['ADDRESS_FORMAT_ETHEREUM', 'ADDRESS_FORMAT_SOLANA'],
+      })
+    } catch (e) {
+      console.error('Failed to create wallet:', e)
+    }
+  }, [session, createWallet, wallets])
+
+  useEffect(() => {
+    if (isConnected) {
+      ensureWallet()
+    }
+  }, [isConnected, ensureWallet])
+
+  // Fetch balances
+  const fetchBalances = useCallback(async () => {
+    if (!solanaAddress && !polygonAddress) return
+    setBalancesLoading(true)
+    
+    try {
+      const response = await fetch('/api/balance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ solanaAddress, polygonAddress }),
+      })
+      const data = await response.json()
+      setBalances(data)
+    } catch (e) {
+      console.error('Balance fetch error:', e)
+    } finally {
+      setBalancesLoading(false)
+    }
+  }, [solanaAddress, polygonAddress])
+
+  useEffect(() => {
+    if (solanaAddress || polygonAddress) {
+      fetchBalances()
+      const interval = setInterval(fetchBalances, 30000)
+      return () => clearInterval(interval)
+    }
+  }, [solanaAddress, polygonAddress, fetchBalances])
+
+  // Fetch markets
+  const fetchMarkets = useCallback(async () => {
+    setMarketsLoading(true)
+    try {
+      const response = await fetch('/api/markets?limit=50')
+      const data = await response.json()
+      setMarkets(data.markets || [])
+    } catch (e) {
+      console.error('Markets fetch error:', e)
+    } finally {
+      setMarketsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchMarkets()
+    const interval = setInterval(fetchMarkets, 60000)
+    return () => clearInterval(interval)
+  }, [fetchMarkets])
+
+  // Get bridge quote (deposit or withdraw) via LiFi
+  const getBridgeQuote = useCallback(async () => {
+    if (!bridgeAmount || parseFloat(bridgeAmount) <= 0 || !solanaAddress || !polygonAddress) return
+    setBridgeLoading(true)
+    
+    try {
+      const params = new URLSearchParams({
+        amount: bridgeAmount,
+        direction: bridgeDirection,
+        solanaAddress,
+        polygonAddress,
+      })
+      
+      if (bridgeDirection === 'deposit') {
+        params.append('fromToken', bridgeToken)
+      } else {
+        params.append('toToken', withdrawToken)
+      }
+      
+      const response = await fetch(`/api/bridge?${params}`)
+      const data = await response.json()
+      
+      if (data.error) {
+        console.error('Bridge quote error:', data.error)
+        setBridgeQuote(null)
+      } else {
+        setBridgeQuote(data.quote)
+        // Store transaction request for execution
+        setBridgeTxRequest(data.transactionRequest)
+      }
+    } catch (e) {
+      console.error('Bridge quote error:', e)
+      setBridgeQuote(null)
+    } finally {
+      setBridgeLoading(false)
+    }
+  }, [bridgeAmount, bridgeToken, bridgeDirection, withdrawToken, solanaAddress, polygonAddress])
+
+  useEffect(() => {
+    const timeout = setTimeout(getBridgeQuote, 500)
+    return () => clearTimeout(timeout)
+  }, [bridgeAmount, bridgeToken, bridgeDirection, withdrawToken, solanaAddress, polygonAddress, getBridgeQuote])
+
+  // Execute bridge with Turnkey signing
+  const executeBridge = useCallback(async () => {
+    if (!bridgeQuote || !bridgeTxRequest || !httpClient || !session) {
+      alert('Missing bridge data')
+      return
+    }
+
+    setBridgeExecuting(true)
+
+    try {
+      if (bridgeDirection === 'deposit') {
+        // Solana -> Polygon: Sign Solana transaction
+        const { Connection, VersionedTransaction } = await import('@solana/web3.js')
+        const { TurnkeySigner } = await import('@turnkey/solana')
+
+        // Decode transaction from LiFi
+        const txBuffer = Buffer.from(bridgeTxRequest.data, 'base64')
+        const transaction = VersionedTransaction.deserialize(new Uint8Array(txBuffer))
+
+        // Create Turnkey Solana signer
+        const turnkeySigner = new TurnkeySigner({
+          organizationId: session.organizationId,
+          client: httpClient,
+        })
+
+        // Sign with Turnkey
+        await turnkeySigner.addSignature(transaction, solanaAddress!)
+
+        // Send to Solana
+        const SOLANA_RPC = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com'
+        const connection = new Connection(SOLANA_RPC)
+        
+        const signature = await connection.sendTransaction(transaction, {
+          skipPreflight: true,
+          maxRetries: 3,
+        })
+
+        alert(`Bridge initiated! Tx: ${signature.slice(0, 16)}...\n\nFunds will arrive in ~60 seconds.`)
+        
+        // Reset state and refresh balances
+        setBridgeAmount('')
+        setBridgeQuote(null)
+        setBridgeTxRequest(null)
+        setTimeout(fetchBalances, 5000)
+        setTimeout(fetchBalances, 30000)
+        setTimeout(fetchBalances, 60000)
+
+      } else {
+        // Polygon -> Solana: Sign EVM transaction
+        const { createWalletClient, http } = await import('viem')
+        const { polygon } = await import('viem/chains')
+        const { createAccount } = await import('@turnkey/viem')
+
+        const turnkeyAccount = await createAccount({
+          client: httpClient,
+          organizationId: session.organizationId,
+          signWith: polygonAddress!,
+          ethereumAddress: polygonAddress!,
+        })
+
+        const walletClient = createWalletClient({
+          account: turnkeyAccount,
+          chain: polygon,
+          transport: http(process.env.NEXT_PUBLIC_POLYGON_RPC_URL || 'https://polygon-rpc.com'),
+        })
+
+        const hash = await walletClient.sendTransaction({
+          to: bridgeTxRequest.to as `0x${string}`,
+          data: bridgeTxRequest.data as `0x${string}`,
+          value: BigInt(bridgeTxRequest.value || '0'),
+        })
+
+        alert(`Bridge initiated! Tx: ${hash.slice(0, 16)}...\n\nFunds will arrive in ~2-5 minutes.`)
+        
+        // Reset state
+        setBridgeAmount('')
+        setBridgeQuote(null)
+        setBridgeTxRequest(null)
+        setTimeout(fetchBalances, 10000)
+        setTimeout(fetchBalances, 60000)
+        setTimeout(fetchBalances, 180000)
+      }
+    } catch (err: any) {
+      console.error('Bridge execution error:', err)
+      alert(`Bridge failed: ${err.message}`)
+    } finally {
+      setBridgeExecuting(false)
+    }
+  }, [bridgeQuote, bridgeTxRequest, bridgeDirection, httpClient, session, solanaAddress, polygonAddress, fetchBalances])
+
+  // Initialize trading session when switching to real money
+  useEffect(() => {
+    if (isRealMoney && isConnected && polygonAddress && !tradingSession && !isTradingInitializing) {
+      initializeTradingSession()
+    }
+  }, [isRealMoney, isConnected, polygonAddress, tradingSession, isTradingInitializing, initializeTradingSession])
+
+  // Handle bet
+  const handleBet = async (market: Market, side: 'YES' | 'NO', amount: number) => {
+    if (!isConnected) {
+      handleLogin()
+      return
+    }
+    
+    if (amount > tradingBalance) {
+      alert('Insufficient balance')
+      return
+    }
+
+    const outcome = side === 'YES' ? market.outcomes[0] : market.outcomes[1]
+    const price = outcome.price
+
+    // Demo mode - simulate trade
+    if (!isRealMoney) {
+      setPositions(prev => [...prev, {
+        id: Date.now(),
+        marketId: market.id,
+        question: market.question,
+        side,
+        stake: amount,
+        entryPrice: price,
+        currentPrice: price,
+        tokenId: outcome.tokenId,
+      }])
+      setDemoBal(b => b - amount)
+      setStats(s => ({ ...s, totalTrades: s.totalTrades + 1 }))
+      setSelectedMarket(null)
+      return
+    }
+
+    // Real money mode - use Polymarket CLOB
+    if (!tradingSession?.isReady) {
+      alert('Trading session not ready. Please wait...')
+      return
+    }
+
+    if (!outcome.tokenId) {
+      alert('Market not available for real trading')
+      return
+    }
+
+    try {
+      const response = await placeOrder({
+        tokenId: outcome.tokenId,
+        price: price,
+        size: amount / price, // Convert USD amount to shares
+        side: 'BUY',
+        negRisk: market.negRisk, // Pass market type flag
+      })
+
+      // Add to positions
+      setPositions(prev => [...prev, {
+        id: Date.now(),
+        marketId: market.id,
+        question: market.question,
+        side,
+        stake: amount,
+        entryPrice: price,
+        currentPrice: price,
+        tokenId: outcome.tokenId,
+      }])
+
+      setSelectedMarket(null)
+      alert(`Order placed! ID: ${response.orderID || 'pending'}`)
+    } catch (err: any) {
+      console.error('Order error:', err)
+      alert(`Order failed: ${err.message}`)
+    }
+  }
+
+  // Create user market
+  const createUserMarket = () => {
+    if (!newMarketQuestion.trim() || !newMarketCategory || !newMarketEndDate) return
+    
+    const newMarket: Market = {
+      id: `user-${Date.now()}`,
+      conditionId: `user-${Date.now()}`,
+      question: newMarketQuestion,
+      slug: newMarketQuestion.toLowerCase().replace(/\s+/g, '-').slice(0, 50),
+      description: '',
+      image: null,
+      category: newMarketCategory,
+      endDate: new Date(newMarketEndDate).toISOString(),
+      outcomes: [
+        { name: 'Yes', price: 0.5, tokenId: `user-yes-${Date.now()}` },
+        { name: 'No', price: 0.5, tokenId: `user-no-${Date.now()}` },
+      ],
+      volume: 0,
+      liquidity: 1000,
+      yesPrice: 0.5,
+      noPrice: 0.5,
+      isUserCreated: true,
+    }
+    
+    setUserMarkets(prev => [newMarket, ...prev])
+    setNewMarketQuestion('')
+    setNewMarketCategory('')
+    setNewMarketEndDate('')
+    setView('markets')
+  }
+
+  // Calculate P&L
+  const totalPnl = positions.reduce((sum, p) => {
+    const currentValue = p.stake * (p.currentPrice / p.entryPrice)
+    return sum + (currentValue - p.stake)
+  }, 0)
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#f4f1eb' }}>
+      {/* Header */}
+      <header style={{ 
+        background: '#0a0a0a', 
+        color: '#f4f1eb', 
+        padding: '12px 20px',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        position: 'sticky',
+        top: 0,
+        zIndex: 50,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <span style={{ fontFamily: 'JetBrains Mono', fontWeight: 700, fontSize: 18 }}>POLYTICKERS</span>
+          <span style={{ 
+            fontSize: 10, 
+            fontFamily: 'JetBrains Mono',
+            background: isRealMoney ? '#1e6f50' : '#b45309',
+            padding: '2px 8px',
+          }}>
+            {isRealMoney ? 'REAL' : 'DEMO'}
+          </span>
+        </div>
+        
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          {isConnected && (
+            <>
+              <span style={{ fontFamily: 'JetBrains Mono', fontSize: 14 }}>
+                ${fmtUsd(tradingBalance)}
+              </span>
+              <button
+                onClick={() => setIsRealMoney(!isRealMoney)}
+                style={{
+                  fontFamily: 'JetBrains Mono',
+                  fontSize: 10,
+                  padding: '6px 12px',
+                  background: 'transparent',
+                  border: '1px solid #f4f1eb',
+                  color: '#f4f1eb',
+                  cursor: 'pointer',
+                }}
+              >
+                {isRealMoney ? 'SWITCH TO DEMO' : 'SWITCH TO REAL'}
+              </button>
+            </>
+          )}
+          
+          {isConnected ? (
+            <button
+              onClick={logout}
+              style={{
+                fontFamily: 'JetBrains Mono',
+                fontSize: 11,
+                padding: '8px 16px',
+                background: '#f4f1eb',
+                color: '#0a0a0a',
+                border: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              LOGOUT
+            </button>
+          ) : (
+            <button
+              onClick={handleLogin}
+              style={{
+                fontFamily: 'JetBrains Mono',
+                fontSize: 11,
+                padding: '8px 16px',
+                background: '#f4f1eb',
+                color: '#0a0a0a',
+                border: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              LOGIN WITH EMAIL
+            </button>
+          )}
+        </div>
+      </header>
+
+      {/* Mode Banner */}
+      {isConnected && (
+        <div style={{
+          background: isRealMoney 
+            ? (isTradingInitializing ? '#0369a1' : tradingSession?.isReady ? '#1e6f50' : '#dc2626')
+            : '#b45309',
+          color: '#fff',
+          padding: '8px 20px',
+          fontSize: 12,
+          fontFamily: 'JetBrains Mono',
+          display: 'flex',
+          justifyContent: 'space-between',
+        }}>
+          <span>
+            {isRealMoney 
+              ? isTradingInitializing 
+                ? `INITIALIZING: ${tradingStep}` 
+                : tradingSession?.isReady 
+                  ? `REAL MONEY - Connected to Polymarket | $${fmtUsd(balances.polygon.usdc)} USDC`
+                  : tradingError 
+                    ? `ERROR: ${tradingError}` 
+                    : 'Connecting...'
+              : `DEMO MODE - $${fmtUsd(demoBal)} play money`}
+          </span>
+          {isRealMoney && balances.polygon.usdc === 0 && tradingSession?.isReady && (
+            <button
+              onClick={() => setView('wallet')}
+              style={{
+                background: '#fff',
+                color: '#1e6f50',
+                border: 'none',
+                padding: '2px 12px',
+                fontSize: 10,
+                fontFamily: 'JetBrains Mono',
+                cursor: 'pointer',
+              }}
+            >
+              DEPOSIT SOL TO START
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Navigation */}
+      <nav style={{
+        display: 'flex',
+        gap: 0,
+        borderBottom: '2px solid #0a0a0a',
+        background: '#f4f1eb',
+      }}>
+        {['markets', 'positions', 'wallet', 'create'].map(v => (
+          <button
+            key={v}
+            onClick={() => setView(v as any)}
+            style={{
+              flex: 1,
+              padding: '14px',
+              fontFamily: 'JetBrains Mono',
+              fontSize: 11,
+              background: view === v ? '#0a0a0a' : 'transparent',
+              color: view === v ? '#f4f1eb' : '#0a0a0a',
+              border: 'none',
+              borderRight: '1px solid #0a0a0a',
+              cursor: 'pointer',
+              textTransform: 'uppercase',
+            }}
+          >
+            {v}
+            {v === 'positions' && positions.length > 0 && ` (${positions.length})`}
+          </button>
+        ))}
+      </nav>
+
+      {/* Main Content */}
+      <main style={{ maxWidth: 800, margin: '0 auto', padding: 20 }}>
+        {/* Markets View */}
+        {view === 'markets' && (
+          <>
+            {/* Quick bet selector */}
+            <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'center' }}>
+              <span style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b' }}>QUICK BET:</span>
+              {[10, 25, 50, 100].map(amt => (
+                <button
+                  key={amt}
+                  onClick={() => setQuickBetAmount(amt)}
+                  style={{
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 10,
+                    padding: '4px 10px',
+                    background: quickBetAmount === amt ? '#0a0a0a' : '#f4f1eb',
+                    color: quickBetAmount === amt ? '#f4f1eb' : '#0a0a0a',
+                    border: '1px solid #0a0a0a',
+                    cursor: 'pointer',
+                  }}
+                >
+                  ${amt}
+                </button>
+              ))}
+            </div>
+
+            {marketsLoading ? (
+              <div style={{ textAlign: 'center', padding: 40, fontFamily: 'JetBrains Mono', fontSize: 12 }}>
+                Loading markets...
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gap: 12 }}>
+                {/* User created markets */}
+                {userMarkets.map(market => (
+                  <MarketCard
+                    key={market.id}
+                    market={market}
+                    quickBetAmount={quickBetAmount}
+                    onBet={handleBet}
+                    onClick={() => setSelectedMarket(market)}
+                    isUserCreated
+                  />
+                ))}
+                
+                {/* Polymarket markets */}
+                {markets.map(market => (
+                  <MarketCard
+                    key={market.id}
+                    market={market}
+                    quickBetAmount={quickBetAmount}
+                    onBet={handleBet}
+                    onClick={() => setSelectedMarket(market)}
+                  />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Positions View */}
+        {view === 'positions' && (
+          <>
+            <div style={{ 
+              background: '#0a0a0a', 
+              color: '#f4f1eb', 
+              padding: 20, 
+              marginBottom: 20,
+              display: 'flex',
+              justifyContent: 'space-between',
+            }}>
+              <div>
+                <div style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b' }}>TOTAL P&L</div>
+                <div style={{ 
+                  fontSize: 28, 
+                  fontWeight: 700, 
+                  fontFamily: 'JetBrains Mono',
+                  color: totalPnl >= 0 ? '#4ade80' : '#f87171',
+                }}>
+                  {totalPnl >= 0 ? '+' : ''}{fmtUsd(totalPnl)}
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b' }}>POSITIONS</div>
+                <div style={{ fontSize: 28, fontWeight: 700, fontFamily: 'JetBrains Mono' }}>{positions.length}</div>
+              </div>
+            </div>
+
+            {positions.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: 40, background: '#e8e4db' }}>
+                <div style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#6b6b6b' }}>No positions yet</div>
+                <button
+                  onClick={() => setView('markets')}
+                  style={{
+                    marginTop: 12,
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 11,
+                    padding: '10px 20px',
+                    background: '#0a0a0a',
+                    color: '#f4f1eb',
+                    border: 'none',
+                    cursor: 'pointer',
+                  }}
+                >
+                  BROWSE MARKETS
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gap: 8 }}>
+                {positions.map(pos => {
+                  const pnl = (pos.currentPrice / pos.entryPrice - 1) * pos.stake
+                  return (
+                    <div key={pos.id} style={{ 
+                      padding: 16, 
+                      background: '#fff', 
+                      border: '1px solid #0a0a0a',
+                    }}>
+                      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>{pos.question}</div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                          <span style={{
+                            fontFamily: 'JetBrains Mono',
+                            fontSize: 10,
+                            padding: '2px 8px',
+                            background: pos.side === 'YES' ? '#1e6f50' : '#c41e3a',
+                            color: '#fff',
+                          }}>
+                            {pos.side}
+                          </span>
+                          <span style={{ fontFamily: 'JetBrains Mono', fontSize: 11, marginLeft: 8 }}>
+                            ${fmtUsd(pos.stake)} @ {fmtCents(pos.entryPrice)}
+                          </span>
+                        </div>
+                        <div style={{
+                          fontFamily: 'JetBrains Mono',
+                          fontSize: 14,
+                          fontWeight: 600,
+                          color: pnl >= 0 ? '#1e6f50' : '#dc2626',
+                        }}>
+                          {pnl >= 0 ? '+' : ''}{fmtUsd(pnl)}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Wallet View */}
+        {view === 'wallet' && (
+          <>
+            {!isConnected ? (
+              <div style={{ textAlign: 'center', padding: 40, background: '#e8e4db' }}>
+                <div style={{ fontFamily: 'JetBrains Mono', fontSize: 12, marginBottom: 16 }}>Connect to view your wallet</div>
+                <button
+                  onClick={handleLogin}
+                  style={{
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 11,
+                    padding: '12px 24px',
+                    background: '#0a0a0a',
+                    color: '#f4f1eb',
+                    border: 'none',
+                    cursor: 'pointer',
+                  }}
+                >
+                  LOGIN WITH EMAIL
+                </button>
+              </div>
+            ) : (
+              <>
+                {/* Solana Wallet */}
+                <div style={{ background: '#9945FF', color: '#fff', padding: 20, marginBottom: 2 }}>
+                  <div style={{ fontFamily: 'JetBrains Mono', fontSize: 10, opacity: 0.7 }}>SOLANA WALLET (DEPOSIT HERE)</div>
+                  <div style={{ fontSize: 24, fontWeight: 700, fontFamily: 'JetBrains Mono', marginTop: 8 }}>
+                    {fmtUsd(balances.solana.sol)} SOL
+                  </div>
+                  <div style={{ fontSize: 14, fontFamily: 'JetBrains Mono', opacity: 0.8 }}>
+                    {fmtUsd(balances.solana.usdc)} USDC
+                  </div>
+                  <div style={{ 
+                    fontFamily: 'JetBrains Mono', 
+                    fontSize: 10, 
+                    marginTop: 12, 
+                    background: 'rgba(0,0,0,0.2)', 
+                    padding: '8px 12px',
+                    wordBreak: 'break-all',
+                  }}>
+                    {solanaAddress || 'Loading...'}
+                  </div>
+                  <button
+                    onClick={() => solanaAddress && navigator.clipboard.writeText(solanaAddress)}
+                    style={{
+                      marginTop: 8,
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 10,
+                      padding: '8px 16px',
+                      background: '#fff',
+                      color: '#9945FF',
+                      border: 'none',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    COPY ADDRESS
+                  </button>
+                </div>
+
+                {/* Bridge Section */}
+                <div style={{ background: '#e8e4db', padding: 20, marginBottom: 2 }}>
+                  {/* Direction Tabs */}
+                  <div style={{ display: 'flex', gap: 0, marginBottom: 16 }}>
+                    <button
+                      onClick={() => { setBridgeDirection('deposit'); setBridgeAmount(''); setBridgeQuote(null); }}
+                      style={{
+                        flex: 1,
+                        fontFamily: 'JetBrains Mono',
+                        fontSize: 11,
+                        padding: '10px',
+                        background: bridgeDirection === 'deposit' ? '#0a0a0a' : '#f4f1eb',
+                        color: bridgeDirection === 'deposit' ? '#f4f1eb' : '#0a0a0a',
+                        border: '2px solid #0a0a0a',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      DEPOSIT (SOL to USDC)
+                    </button>
+                    <button
+                      onClick={() => { setBridgeDirection('withdraw'); setBridgeAmount(''); setBridgeQuote(null); }}
+                      style={{
+                        flex: 1,
+                        fontFamily: 'JetBrains Mono',
+                        fontSize: 11,
+                        padding: '10px',
+                        background: bridgeDirection === 'withdraw' ? '#0a0a0a' : '#f4f1eb',
+                        color: bridgeDirection === 'withdraw' ? '#f4f1eb' : '#0a0a0a',
+                        border: '2px solid #0a0a0a',
+                        borderLeft: 'none',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      WITHDRAW (USDC to SOL)
+                    </button>
+                  </div>
+
+                  <div style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b', marginBottom: 12 }}>
+                    {bridgeDirection === 'deposit' 
+                      ? 'BRIDGE SOL/USDC FROM SOLANA TO POLYGON FOR TRADING'
+                      : 'WITHDRAW USDC FROM POLYGON TO SOLANA'}
+                  </div>
+                  
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                    {bridgeDirection === 'deposit' ? (
+                      <select
+                        value={bridgeToken}
+                        onChange={e => setBridgeToken(e.target.value as 'SOL' | 'USDC')}
+                        style={{
+                          fontFamily: 'JetBrains Mono',
+                          fontSize: 12,
+                          padding: '10px',
+                          border: '2px solid #0a0a0a',
+                          background: '#f4f1eb',
+                        }}
+                      >
+                        <option value="SOL">SOL</option>
+                        <option value="USDC">USDC</option>
+                      </select>
+                    ) : (
+                      <select
+                        value={withdrawToken}
+                        onChange={e => setWithdrawToken(e.target.value as 'SOL' | 'USDC')}
+                        style={{
+                          fontFamily: 'JetBrains Mono',
+                          fontSize: 12,
+                          padding: '10px',
+                          border: '2px solid #0a0a0a',
+                          background: '#f4f1eb',
+                        }}
+                      >
+                        <option value="USDC">USDC</option>
+                        <option value="SOL">SOL</option>
+                      </select>
+                    )}
+                    <input
+                      type="number"
+                      value={bridgeAmount}
+                      onChange={e => setBridgeAmount(e.target.value)}
+                      placeholder={bridgeDirection === 'deposit' ? 'Amount to deposit' : 'USDC amount to withdraw'}
+                      style={{
+                        flex: 1,
+                        fontFamily: 'JetBrains Mono',
+                        fontSize: 12,
+                        padding: '10px',
+                        border: '2px solid #0a0a0a',
+                        background: '#f4f1eb',
+                      }}
+                    />
+                  </div>
+
+                  {/* Balance helper */}
+                  <div style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b', marginBottom: 12 }}>
+                    {bridgeDirection === 'deposit' 
+                      ? `Available: ${fmtUsd(bridgeToken === 'SOL' ? balances.solana.sol : balances.solana.usdc)} ${bridgeToken}`
+                      : `Available: ${fmtUsd(balances.polygon.usdc)} USDC`}
+                  </div>
+
+                  {bridgeQuote && (
+                    <div style={{ 
+                      background: '#fff', 
+                      padding: 12, 
+                      marginBottom: 12,
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 11,
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span style={{ color: '#6b6b6b' }}>You receive:</span>
+                        <span style={{ fontWeight: 600 }}>
+                          ~{fmtUsd(parseFloat(bridgeQuote.toAmount))} {bridgeQuote.toToken}
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                        <span style={{ color: '#6b6b6b' }}>Min receive:</span>
+                        <span>{fmtUsd(parseFloat(bridgeQuote.toAmountMin))} {bridgeQuote.toToken}</span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                        <span style={{ color: '#6b6b6b' }}>Est. time:</span>
+                        <span>~{bridgeQuote.estimatedTime}s</span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                        <span style={{ color: '#6b6b6b' }}>Fees:</span>
+                        <span>${bridgeQuote.feeCosts} + ${bridgeQuote.gasCosts} gas</span>
+                      </div>
+                      {bridgeQuote.integratorFee && parseFloat(bridgeQuote.integratorFee) > 0 && (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                          <span style={{ color: '#6b6b6b' }}>Service fee:</span>
+                          <span>${bridgeQuote.integratorFee}</span>
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                        <span style={{ color: '#6b6b6b' }}>Route:</span>
+                        <span>{bridgeQuote.toolName || bridgeQuote.tool}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  <button
+                    disabled={!bridgeQuote || bridgeLoading || bridgeExecuting}
+                    onClick={executeBridge}
+                    style={{
+                      width: '100%',
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 11,
+                      padding: '12px',
+                      background: bridgeQuote && !bridgeExecuting ? (bridgeDirection === 'deposit' ? '#9945FF' : '#8247E5') : '#6b6b6b',
+                      color: '#fff',
+                      border: 'none',
+                      cursor: bridgeQuote && !bridgeExecuting ? 'pointer' : 'not-allowed',
+                    }}
+                  >
+                    {bridgeExecuting 
+                      ? 'SIGNING...'
+                      : bridgeLoading 
+                        ? 'GETTING QUOTE...' 
+                        : bridgeDirection === 'deposit' 
+                          ? 'BRIDGE TO POLYGON' 
+                          : 'WITHDRAW TO SOLANA'}
+                  </button>
+                  
+                  <div style={{ fontFamily: 'JetBrains Mono', fontSize: 9, color: '#6b6b6b', marginTop: 8, textAlign: 'center' }}>
+                    Powered by LI.FI | Cross-chain in ~60s
+                  </div>
+                </div>
+
+                {/* Polygon Wallet */}
+                <div style={{ background: '#8247E5', color: '#fff', padding: 20 }}>
+                  <div style={{ fontFamily: 'JetBrains Mono', fontSize: 10, opacity: 0.7 }}>POLYGON WALLET (TRADING)</div>
+                  <div style={{ fontSize: 24, fontWeight: 700, fontFamily: 'JetBrains Mono', marginTop: 8 }}>
+                    ${fmtUsd(balances.polygon.usdc)} USDC
+                  </div>
+                  <div style={{ fontSize: 14, fontFamily: 'JetBrains Mono', opacity: 0.8 }}>
+                    {fmtUsd(balances.polygon.matic)} POL
+                  </div>
+                  <div style={{ 
+                    fontFamily: 'JetBrains Mono', 
+                    fontSize: 10, 
+                    marginTop: 12, 
+                    background: 'rgba(0,0,0,0.2)', 
+                    padding: '8px 12px',
+                    wordBreak: 'break-all',
+                  }}>
+                    {polygonAddress || 'Loading...'}
+                  </div>
+                </div>
+
+                {/* Action Buttons */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 16 }}>
+                  <button
+                    onClick={() => setShowSendModal(true)}
+                    style={{
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 11,
+                      padding: '14px',
+                      background: '#f4f1eb',
+                      color: '#0a0a0a',
+                      border: '2px solid #0a0a0a',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    SEND / WITHDRAW
+                  </button>
+                  <button
+                    onClick={fetchBalances}
+                    style={{
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 11,
+                      padding: '14px',
+                      background: '#f4f1eb',
+                      color: '#0a0a0a',
+                      border: '2px solid #0a0a0a',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {balancesLoading ? 'REFRESHING...' : 'REFRESH BALANCES'}
+                  </button>
+                </div>
+              </>
+            )}
+          </>
+        )}
+
+        {/* Create Market View */}
+        {view === 'create' && (
+          <>
+            <div style={{ background: '#b45309', color: '#fff', padding: 16, marginBottom: 20 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>BETA - USER MARKETS</div>
+              <div style={{ fontSize: 13 }}>Create markets for demo trading. User markets use play money only.</div>
+            </div>
+
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ display: 'block', fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b', marginBottom: 8 }}>
+                MARKET QUESTION
+              </label>
+              <input
+                type="text"
+                value={newMarketQuestion}
+                onChange={e => setNewMarketQuestion(e.target.value)}
+                placeholder="Will [event] happen by [date]?"
+                style={{
+                  width: '100%',
+                  fontFamily: 'JetBrains Mono',
+                  fontSize: 14,
+                  padding: '14px',
+                  border: '2px solid #0a0a0a',
+                  background: '#f4f1eb',
+                }}
+              />
+            </div>
+
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ display: 'block', fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b', marginBottom: 8 }}>
+                CATEGORY
+              </label>
+              <select
+                value={newMarketCategory}
+                onChange={e => setNewMarketCategory(e.target.value)}
+                style={{
+                  width: '100%',
+                  fontFamily: 'JetBrains Mono',
+                  fontSize: 14,
+                  padding: '14px',
+                  border: '2px solid #0a0a0a',
+                  background: '#f4f1eb',
+                }}
+              >
+                <option value="">Select category...</option>
+                <option value="crypto">Crypto</option>
+                <option value="politics">Politics</option>
+                <option value="sports">Sports</option>
+                <option value="science">Science</option>
+                <option value="entertainment">Entertainment</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+
+            <div style={{ marginBottom: 24 }}>
+              <label style={{ display: 'block', fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b', marginBottom: 8 }}>
+                RESOLUTION DATE
+              </label>
+              <input
+                type="date"
+                value={newMarketEndDate}
+                onChange={e => setNewMarketEndDate(e.target.value)}
+                style={{
+                  width: '100%',
+                  fontFamily: 'JetBrains Mono',
+                  fontSize: 14,
+                  padding: '14px',
+                  border: '2px solid #0a0a0a',
+                  background: '#f4f1eb',
+                }}
+              />
+            </div>
+
+            <button
+              onClick={createUserMarket}
+              disabled={!newMarketQuestion.trim() || !newMarketCategory || !newMarketEndDate}
+              style={{
+                width: '100%',
+                fontFamily: 'JetBrains Mono',
+                fontSize: 12,
+                padding: '16px',
+                background: (newMarketQuestion.trim() && newMarketCategory && newMarketEndDate) ? '#0a0a0a' : '#6b6b6b',
+                color: '#f4f1eb',
+                border: 'none',
+                cursor: (newMarketQuestion.trim() && newMarketCategory && newMarketEndDate) ? 'pointer' : 'not-allowed',
+              }}
+            >
+              CREATE MARKET
+            </button>
+          </>
+        )}
+      </main>
+
+      {/* Market Detail Modal */}
+      {selectedMarket && (
+        <div 
+          style={{ 
+            position: 'fixed', 
+            inset: 0, 
+            background: 'rgba(0,0,0,0.5)', 
+            display: 'flex', 
+            alignItems: 'center', 
+            justifyContent: 'center',
+            zIndex: 100,
+            padding: 20,
+          }}
+          onClick={() => setSelectedMarket(null)}
+        >
+          <div 
+            style={{ 
+              width: '100%',
+              maxWidth: 500, 
+              background: '#f4f1eb', 
+              border: '2px solid #0a0a0a',
+              maxHeight: '80vh',
+              overflow: 'auto',
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{ padding: '12px 16px', borderBottom: '1px solid #0a0a0a', display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ fontWeight: 700 }}>Trade</span>
+              <button 
+                onClick={() => setSelectedMarket(null)} 
+                style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer' }}
+              >
+                x
+              </button>
+            </div>
+            
+            <div style={{ padding: 20 }}>
+              <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 16, lineHeight: 1.4 }}>
+                {selectedMarket.question}
+              </div>
+              
+              <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+                <span style={{ fontFamily: 'JetBrains Mono', fontSize: 11, color: '#6b6b6b' }}>
+                  {fmtVol(selectedMarket.volume)} volume
+                </span>
+                <span style={{ fontFamily: 'JetBrains Mono', fontSize: 11, color: '#6b6b6b' }}>
+                  Closes: {getTimeRemaining(selectedMarket.endDate)}
+                </span>
+              </div>
+
+              {/* Probability */}
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <span style={{ fontFamily: 'JetBrains Mono', fontSize: 28, fontWeight: 700, color: '#1e6f50' }}>
+                    {Math.round(selectedMarket.yesPrice * 100)}%
+                  </span>
+                  <span style={{ fontFamily: 'JetBrains Mono', fontSize: 28, fontWeight: 700, color: '#c41e3a' }}>
+                    {Math.round(selectedMarket.noPrice * 100)}%
+                  </span>
+                </div>
+                <div style={{ height: 8, background: '#c41e3a', borderRadius: 4 }}>
+                  <div style={{ 
+                    width: `${selectedMarket.yesPrice * 100}%`, 
+                    height: '100%', 
+                    background: '#1e6f50',
+                    borderRadius: 4,
+                  }} />
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                  <span style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#1e6f50' }}>YES</span>
+                  <span style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#c41e3a' }}>NO</span>
+                </div>
+              </div>
+
+              {/* Quick amounts */}
+              <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+                {[10, 25, 50, 100].map(amt => (
+                  <button
+                    key={amt}
+                    onClick={() => setQuickBetAmount(amt)}
+                    style={{
+                      flex: 1,
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 11,
+                      padding: '8px',
+                      background: quickBetAmount === amt ? '#0a0a0a' : '#f4f1eb',
+                      color: quickBetAmount === amt ? '#f4f1eb' : '#0a0a0a',
+                      border: '1px solid #0a0a0a',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    ${amt}
+                  </button>
+                ))}
+              </div>
+
+              {/* Trade buttons */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <button
+                  onClick={() => handleBet(selectedMarket, 'YES', quickBetAmount)}
+                  style={{
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 14,
+                    padding: '16px',
+                    background: '#1e6f50',
+                    color: '#fff',
+                    border: 'none',
+                    cursor: 'pointer',
+                  }}
+                >
+                  BUY YES @ {fmtCents(selectedMarket.yesPrice)}
+                </button>
+                <button
+                  onClick={() => handleBet(selectedMarket, 'NO', quickBetAmount)}
+                  style={{
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 14,
+                    padding: '16px',
+                    background: '#c41e3a',
+                    color: '#fff',
+                    border: 'none',
+                    cursor: 'pointer',
+                  }}
+                >
+                  BUY NO @ {fmtCents(selectedMarket.noPrice)}
+                </button>
+              </div>
+
+              {/* Potential payout */}
+              <div style={{ marginTop: 16, background: '#e8e4db', padding: 12 }}>
+                <div style={{ fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b', marginBottom: 8 }}>
+                  POTENTIAL PAYOUT IF WIN
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 11, color: '#1e6f50' }}>YES wins:</div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 16, fontWeight: 600 }}>
+                      ${fmtUsd(quickBetAmount / selectedMarket.yesPrice)}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 11, color: '#c41e3a' }}>NO wins:</div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 16, fontWeight: 600 }}>
+                      ${fmtUsd(quickBetAmount / selectedMarket.noPrice)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Send Modal */}
+      {showSendModal && (
+        <div 
+          style={{ 
+            position: 'fixed', 
+            inset: 0, 
+            background: 'rgba(0,0,0,0.5)', 
+            display: 'flex', 
+            alignItems: 'center', 
+            justifyContent: 'center',
+            zIndex: 100,
+          }}
+          onClick={() => setShowSendModal(false)}
+        >
+          <div 
+            style={{ width: 400, background: '#f4f1eb', border: '2px solid #0a0a0a' }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{ padding: '12px 16px', borderBottom: '1px solid #0a0a0a', display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ fontWeight: 700 }}>Send / Withdraw</span>
+              <button 
+                onClick={() => setShowSendModal(false)} 
+                style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer' }}
+              >
+                x
+              </button>
+            </div>
+            <div style={{ padding: 20 }}>
+              <div style={{ background: '#e8e4db', padding: 12, marginBottom: 16, fontSize: 12 }}>
+                Send tokens from your Solana or Polygon wallet. Transaction will require wallet signature.
+              </div>
+              
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: 'block', fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b', marginBottom: 8 }}>
+                  DESTINATION ADDRESS
+                </label>
+                <input
+                  type="text"
+                  placeholder="Wallet address..."
+                  style={{
+                    width: '100%',
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 12,
+                    padding: '12px',
+                    border: '2px solid #0a0a0a',
+                    background: '#f4f1eb',
+                  }}
+                />
+              </div>
+
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: 'block', fontFamily: 'JetBrains Mono', fontSize: 10, color: '#6b6b6b', marginBottom: 8 }}>
+                  AMOUNT
+                </label>
+                <input
+                  type="number"
+                  placeholder="0.00"
+                  style={{
+                    width: '100%',
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 12,
+                    padding: '12px',
+                    border: '2px solid #0a0a0a',
+                    background: '#f4f1eb',
+                  }}
+                />
+              </div>
+
+              <button
+                onClick={() => alert('Send functionality requires wallet signature. Coming soon!')}
+                style={{
+                  width: '100%',
+                  fontFamily: 'JetBrains Mono',
+                  fontSize: 11,
+                  padding: '14px',
+                  background: '#0a0a0a',
+                  color: '#f4f1eb',
+                  border: 'none',
+                  cursor: 'pointer',
+                }}
+              >
+                SEND
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Market Card Component
+function MarketCard({ 
+  market, 
+  quickBetAmount, 
+  onBet, 
+  onClick,
+  isUserCreated = false,
+}: { 
+  market: Market
+  quickBetAmount: number
+  onBet: (market: Market, side: 'YES' | 'NO', amount: number) => void
+  onClick: () => void
+  isUserCreated?: boolean
+}) {
+  const yesPercent = Math.round(market.yesPrice * 100)
+  
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        padding: 16,
+        background: isUserCreated ? '#fffbeb' : '#fff',
+        border: isUserCreated ? '2px solid #b45309' : '1px solid #0a0a0a',
+        cursor: 'pointer',
+        transition: 'transform 0.1s',
+      }}
+    >
+      {isUserCreated && (
+        <div style={{ marginBottom: 8 }}>
+          <span style={{ 
+            fontFamily: 'JetBrains Mono', 
+            fontSize: 9, 
+            background: '#b45309', 
+            color: '#fff', 
+            padding: '2px 6px',
+          }}>
+            USER CREATED
+          </span>
+        </div>
+      )}
+      
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8, lineHeight: 1.3 }}>
+            {market.question}
+          </div>
+          <div style={{ display: 'flex', gap: 16 }}>
+            <span style={{ fontFamily: 'JetBrains Mono', fontSize: 11, color: '#6b6b6b' }}>
+              {fmtVol(market.volume)} vol
+            </span>
+            <span style={{ fontFamily: 'JetBrains Mono', fontSize: 11, color: '#6b6b6b' }}>
+              {getTimeRemaining(market.endDate)}
+            </span>
+          </div>
+        </div>
+        <div style={{ textAlign: 'right', minWidth: 80 }}>
+          <div style={{ 
+            fontFamily: 'JetBrains Mono', 
+            fontSize: 24, 
+            fontWeight: 700, 
+            color: yesPercent > 50 ? '#1e6f50' : '#6b6b6b',
+          }}>
+            {yesPercent}%
+          </div>
+          <div style={{ fontFamily: 'JetBrains Mono', fontSize: 9, color: '#6b6b6b' }}>YES</div>
+        </div>
+      </div>
+
+      {/* Probability bar */}
+      <div style={{ height: 4, background: '#ddd', marginTop: 12, borderRadius: 2 }}>
+        <div style={{ 
+          width: `${yesPercent}%`, 
+          height: '100%', 
+          background: '#1e6f50',
+          borderRadius: 2,
+        }} />
+      </div>
+
+      {/* Quick bet buttons */}
+      <div 
+        style={{ display: 'flex', gap: 8, marginTop: 12 }}
+        onClick={e => e.stopPropagation()}
+      >
+        <button
+          onClick={() => onBet(market, 'YES', quickBetAmount)}
+          style={{
+            flex: 1,
+            fontFamily: 'JetBrains Mono',
+            fontSize: 11,
+            padding: '10px',
+            background: '#1e6f50',
+            color: '#fff',
+            border: 'none',
+            cursor: 'pointer',
+          }}
+        >
+          YES {fmtCents(market.yesPrice)}
+        </button>
+        <button
+          onClick={() => onBet(market, 'NO', quickBetAmount)}
+          style={{
+            flex: 1,
+            fontFamily: 'JetBrains Mono',
+            fontSize: 11,
+            padding: '10px',
+            background: '#c41e3a',
+            color: '#fff',
+            border: 'none',
+            cursor: 'pointer',
+          }}
+        >
+          NO {fmtCents(market.noPrice)}
+        </button>
+      </div>
+    </div>
+  )
+}
